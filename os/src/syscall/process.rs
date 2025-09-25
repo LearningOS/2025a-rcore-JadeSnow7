@@ -38,8 +38,34 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-// TODO: implement the syscall
-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
-    trace!("kernel: sys_trace");
-    -1
+/// sys_trace system call implementation
+/// - trace_request = 0: read byte from user address id (return the value)
+/// - trace_request = 1: write data (as u8) to user address id (return 0)
+/// - trace_request = 2: query syscall times for syscall id (return the count, including current call)
+/// - other values: return -1
+pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
+    trace!("kernel: sys_trace request={}, id={}, data={}", trace_request, id, data);
+    match trace_request {
+        0 => {
+            // Read a byte from address id
+            let ptr = id as *const u8;
+            unsafe {
+                *ptr as isize
+            }
+        },
+        1 => {
+            // Write data (as u8) to address id
+            let ptr = id as *mut u8;
+            let value = data as u8;
+            unsafe {
+                *ptr = value;
+            }
+            0
+        },
+        2 => {
+            // Query syscall times for syscall id
+            crate::task::get_syscall_times(id) as isize
+        },
+        _ => -1
+    }
 }
