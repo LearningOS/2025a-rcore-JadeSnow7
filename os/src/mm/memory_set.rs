@@ -72,6 +72,76 @@ impl MemorySet {
             self.areas.remove(idx);
         }
     }
+    
+    /// Map memory for mmap syscall
+    pub fn mmap(&mut self, start: usize, len: usize, port: usize) -> isize {
+        // Convert port bits to MapPermission
+        let mut map_perm = MapPermission::U;
+        if port & 0x1 != 0 { map_perm |= MapPermission::R; }
+        if port & 0x2 != 0 { map_perm |= MapPermission::W; }
+        if port & 0x4 != 0 { map_perm |= MapPermission::X; }
+        
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        
+        // Check if start is page-aligned
+        if start_va.page_offset() != 0 {
+            return -1;
+        }
+        
+        // Check if the range overlaps with existing areas
+        let start_vpn: VirtPageNum = start_va.into();
+        let end_vpn: VirtPageNum = end_va.ceil().into();
+        
+        for area in &self.areas {
+            if !(end_vpn <= area.vpn_range.get_start() || start_vpn >= area.vpn_range.get_end()) {
+                return -1; // Overlap detected
+            }
+        }
+        
+        // Create and insert the new map area
+        self.insert_framed_area(start_va, end_va, map_perm);
+        0
+    }
+    
+    /// Unmap memory for munmap syscall
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        
+        // Check if start is page-aligned
+        if start_va.page_offset() != 0 {
+            return -1;
+        }
+        
+        let start_vpn: VirtPageNum = start_va.into();
+        let end_vpn: VirtPageNum = end_va.ceil().into();
+        
+        // Find areas that need to be removed
+        let mut areas_to_remove = Vec::new();
+        for (idx, area) in self.areas.iter().enumerate() {
+            if area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn {
+                areas_to_remove.push(idx);
+            }
+        }
+        
+        if areas_to_remove.is_empty() {
+            return -1;
+        }
+        
+        // Remove areas in reverse order to maintain indices
+        for &idx in areas_to_remove.iter().rev() {
+            let _area = self.areas.remove(idx);
+            // Unmap will be handled by the MapArea's Drop implementation
+        }
+        
+        // Manually unmap pages from page table
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            self.page_table.unmap(vpn);
+        }
+        
+        0
+    }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
     /// space.

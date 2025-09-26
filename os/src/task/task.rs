@@ -34,6 +34,26 @@ impl TaskControlBlock {
         let inner = self.inner_exclusive_access();
         inner.memory_set.token()
     }
+    /// Get task priority
+    pub fn get_priority(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.priority
+    }
+    /// Set task priority
+    pub fn set_priority(&self, priority: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.priority = priority;
+    }
+    /// Get pass value for stride scheduling
+    pub fn get_pass(&self) -> usize {
+        let inner = self.inner_exclusive_access();
+        inner.pass
+    }
+    /// Set pass value for stride scheduling
+    pub fn set_pass(&self, pass: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.pass = pass;
+    }
 }
 
 pub struct TaskControlBlockInner {
@@ -68,6 +88,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Task priority (for stride scheduling)
+    pub priority: usize,
+
+    /// Pass value for stride scheduling
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +144,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16, // Default priority
+                    pass: 0,      // Initial pass value for stride scheduling
                 })
             },
         };
@@ -191,6 +219,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority, // Inherit priority from parent
+                    pass: 0,                         // Reset pass value for new task
                 })
             },
         });
@@ -209,6 +239,60 @@ impl TaskControlBlock {
     /// get pid of process
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    /// Create a new child process directly from an ELF file (spawn)
+    /// Unlike fork + exec, this creates a completely new process
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // Create new memory space from ELF
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        
+        // Allocate new PID and kernel stack
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        
+        // Create new task control block
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    priority: 16, // Default priority for spawned process
+                    pass: 0,
+                })
+            },
+        });
+        
+        // Set up trap context
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        
+        // Add as child to parent
+        let mut parent_inner = self.inner_exclusive_access();
+        parent_inner.children.push(task_control_block.clone());
+        
+        task_control_block
     }
 
     /// change the location of the program break. return None if failed.
