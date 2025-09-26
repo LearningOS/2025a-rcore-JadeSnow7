@@ -53,6 +53,12 @@ impl OSInode {
         }
         v
     }
+
+    /// Get file stats
+    pub fn stat(&self) -> (u64, u32, bool, u32) {
+        let inner = self.inner.exclusive_access();
+        inner.inode.stat()
+    }
 }
 
 lazy_static! {
@@ -125,6 +131,36 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+/// Create a hard link
+pub fn link_file(old_name: &str, new_name: &str) -> isize {
+    if old_name == new_name {
+        return -1; // Cannot link to same name
+    }
+    
+    if let Some(old_inode) = ROOT_INODE.find(old_name) {
+        if old_inode.link(&ROOT_INODE, new_name).is_some() {
+            0
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
+}
+
+/// Remove a hard link  
+pub fn unlink_file(name: &str) -> isize {
+    if let Some(inode) = ROOT_INODE.find(name) {
+        if inode.unlink(&ROOT_INODE, name).is_some() {
+            0
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -155,5 +191,10 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    
+    fn stat(&self) -> (u64, u32, bool, u32) {
+        let inner = self.inner.exclusive_access();
+        inner.inode.stat()
     }
 }
