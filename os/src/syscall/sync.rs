@@ -69,11 +69,27 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .tid
     );
     let process = current_process();
+    let tid = current_task().unwrap().inner_exclusive_access().res.as_ref().unwrap().tid;
+    
+    // Check for deadlock before attempting to lock
+    {
+        let process_inner = process.inner_exclusive_access();
+        if process_inner.check_mutex_deadlock(tid, mutex_id) {
+            trace!("kernel: mutex_lock detected potential deadlock for tid {} mutex {}", tid, mutex_id);
+            return -0xDEAD;
+        }
+    }
+    
     let process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
-    drop(process);
+    
     mutex.lock();
+    
+    // Record the allocation after successful lock
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.record_mutex_allocation(tid, mutex_id, true);
+    
     0
 }
 /// mutex unlock syscall
@@ -90,11 +106,18 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
             .tid
     );
     let process = current_process();
+    let tid = current_task().unwrap().inner_exclusive_access().res.as_ref().unwrap().tid;
+    
     let process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
     drop(process_inner);
-    drop(process);
+    
     mutex.unlock();
+    
+    // Record the deallocation after successful unlock
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.record_mutex_allocation(tid, mutex_id, false);
+    
     0
 }
 /// semaphore create syscall
@@ -143,10 +166,18 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
             .tid
     );
     let process = current_process();
+    let tid = current_task().unwrap().inner_exclusive_access().res.as_ref().unwrap().tid;
+    
     let process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
+    
     sem.up();
+    
+    // Record the deallocation after successful up
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.record_semaphore_allocation(tid, sem_id, false);
+    
     0
 }
 /// semaphore down syscall
@@ -163,10 +194,27 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .tid
     );
     let process = current_process();
+    let tid = current_task().unwrap().inner_exclusive_access().res.as_ref().unwrap().tid;
+    
+    // Check for deadlock before attempting to acquire semaphore
+    {
+        let process_inner = process.inner_exclusive_access();
+        if process_inner.check_semaphore_deadlock(tid, sem_id) {
+            trace!("kernel: semaphore_down detected potential deadlock for tid {} sem {}", tid, sem_id);
+            return -0xDEAD;
+        }
+    }
+    
     let process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
     drop(process_inner);
+    
     sem.down();
+    
+    // Record the allocation after successful down
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.record_semaphore_allocation(tid, sem_id, true);
+    
     0
 }
 /// condvar create syscall
@@ -245,7 +293,27 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 /// enable deadlock detection syscall
 ///
 /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] tid[{}] sys_enable_deadlock_detect",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        current_task()
+            .unwrap()
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .tid
+    );
+    
+    // Check parameter validity
+    if enabled != 0 && enabled != 1 {
+        return -1;
+    }
+    
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.deadlock_detection_enabled = enabled == 1;
+    
+    0
 }

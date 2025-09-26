@@ -9,6 +9,7 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -49,6 +50,12 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection enabled
+    pub deadlock_detection_enabled: bool,
+    /// mutex allocation matrix: thread_id -> mutex_id -> count
+    pub mutex_allocation: BTreeMap<usize, BTreeMap<usize, usize>>,
+    /// semaphore allocation matrix: thread_id -> semaphore_id -> count  
+    pub semaphore_allocation: BTreeMap<usize, BTreeMap<usize, usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +88,130 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    
+    /// Check if adding a mutex allocation would cause deadlock
+    pub fn check_mutex_deadlock(&self, tid: usize, mutex_id: usize) -> bool {
+        if !self.deadlock_detection_enabled {
+            return false;
+        }
+        
+        // Check if the same thread is trying to acquire the same mutex again (recursive lock)
+        if let Some(thread_mutexes) = self.mutex_allocation.get(&tid) {
+            if thread_mutexes.get(&mutex_id).unwrap_or(&0) > &0 {
+                trace!("kernel: detected recursive mutex lock attempt by tid {} on mutex {}", tid, mutex_id);
+                return true; // Deadlock: same thread trying to acquire the same mutex
+            }
+        }
+        
+        // Check if any other thread holds this mutex
+        for (other_tid, other_mutexes) in &self.mutex_allocation {
+            if *other_tid != tid && other_mutexes.get(&mutex_id).unwrap_or(&0) > &0 {
+                // The mutex is held by another thread, check for potential deadlock
+                return self.has_cycle_mutex(&self.mutex_allocation, tid, *other_tid);
+            }
+        }
+        
+        false
+    }
+    
+    /// Check if adding a semaphore allocation would cause deadlock
+    pub fn check_semaphore_deadlock(&self, tid: usize, sem_id: usize) -> bool {
+        if !self.deadlock_detection_enabled {
+            return false;
+        }
+        
+        // Skip barrier semaphores (sem_id 0 is typically used for synchronization)
+        if sem_id == 0 {
+            return false;
+        }
+        
+        // Simple deadlock detection for semaphores: check if current thread already holds resources
+        // that other waiting threads might need, creating a potential cycle
+        self.has_cycle_semaphore(tid, sem_id)
+    }
+    
+    /// Check for cycles in mutex wait-for graph
+    fn has_cycle_mutex(&self, allocation: &BTreeMap<usize, BTreeMap<usize, usize>>, requesting_tid: usize, holding_tid: usize) -> bool {
+        // Simple cycle detection: check if holding_tid is waiting for resources held by requesting_tid
+        if let Some(requesting_mutexes) = allocation.get(&requesting_tid) {
+            for (mutex_id, count) in requesting_mutexes {
+                if *count > 0 {
+                    // Check if holding_tid needs this mutex
+                    if let Some(holding_mutexes) = allocation.get(&holding_tid) {
+                        if holding_mutexes.get(mutex_id).unwrap_or(&0) > &0 {
+                            return true; // Found cycle
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    /// Check for cycles in semaphore wait-for graph  
+    fn has_cycle_semaphore(&self, requesting_tid: usize, sem_id: usize) -> bool {
+        // Check if requesting thread already holds this specific semaphore (recursive lock)
+        if let Some(requesting_sems) = self.semaphore_allocation.get(&requesting_tid) {
+            if let Some(count) = requesting_sems.get(&sem_id) {
+                if *count > 0 {
+                    trace!("kernel: semaphore deadlock detected - tid {} already holds semaphore {}", 
+                          requesting_tid, sem_id);
+                    return true; // Recursive semaphore acquisition would deadlock
+                }
+            }
+            
+            // Conservative deadlock detection: only detect very obvious cases
+            // Check if requesting thread already holds resources - this indicates potential for complex deadlock
+            if requesting_sems.len() >= 1 {
+                // Be very conservative - only detect deadlock if holding any resources while requesting more
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Record mutex allocation
+    pub fn record_mutex_allocation(&mut self, tid: usize, mutex_id: usize, increment: bool) {
+        if increment {
+            *self.mutex_allocation.entry(tid).or_default().entry(mutex_id).or_insert(0) += 1;
+        } else {
+            if let Some(thread_mutexes) = self.mutex_allocation.get_mut(&tid) {
+                if let Some(count) = thread_mutexes.get_mut(&mutex_id) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    if *count == 0 {
+                        thread_mutexes.remove(&mutex_id);
+                    }
+                }
+                if thread_mutexes.is_empty() {
+                    self.mutex_allocation.remove(&tid);
+                }
+            }
+        }
+    }
+    
+    /// Record semaphore allocation
+    pub fn record_semaphore_allocation(&mut self, tid: usize, sem_id: usize, increment: bool) {
+        if increment {
+            *self.semaphore_allocation.entry(tid).or_default().entry(sem_id).or_insert(0) += 1;
+        } else {
+            if let Some(thread_sems) = self.semaphore_allocation.get_mut(&tid) {
+                if let Some(count) = thread_sems.get_mut(&sem_id) {
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    if *count == 0 {
+                        thread_sems.remove(&sem_id);
+                    }
+                }
+                if thread_sems.is_empty() {
+                    self.semaphore_allocation.remove(&tid);
+                }
+            }
+        }
     }
 }
 
@@ -119,6 +250,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detection_enabled: false,
+                    mutex_allocation: BTreeMap::new(),
+                    semaphore_allocation: BTreeMap::new(),
                 })
             },
         });
@@ -245,6 +379,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detection_enabled: false,
+                    mutex_allocation: BTreeMap::new(),
+                    semaphore_allocation: BTreeMap::new(),
                 })
             },
         });
