@@ -17,6 +17,7 @@ mod task;
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
+use crate::mm::{VirtAddr, MapPermission};
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -133,6 +134,42 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Check if an address is readable in current task's address space
+    pub fn current_addr_readable(&self, addr: usize) -> bool {
+        let inner = self.inner.exclusive_access();
+        let vpn = VirtAddr::from(addr).floor();
+        if let Some(pte) = inner.tasks[inner.current_task].memory_set.translate(vpn) {
+            pte.is_valid() && pte.readable()
+        } else {
+            false
+        }
+    }
+
+    /// Check if an address is writable in current task's address space
+    pub fn current_addr_writable(&self, addr: usize) -> bool {
+        let inner = self.inner.exclusive_access();
+        let vpn = VirtAddr::from(addr).floor();
+        if let Some(pte) = inner.tasks[inner.current_task].memory_set.translate(vpn) {
+            pte.is_valid() && pte.writable()
+        } else {
+            false
+        }
+    }
+    
+    /// Map memory for current task (mmap)
+    pub fn current_mmap(&self, start: usize, len: usize, perm: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].mmap(start, len, perm)
+    }
+    
+    /// Unmap memory for current task (munmap)
+    pub fn current_munmap(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +238,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Check if an address is readable in current task's address space
+pub fn current_addr_readable(addr: usize) -> bool {
+    TASK_MANAGER.current_addr_readable(addr)
+}
+
+/// Check if an address is writable in current task's address space  
+pub fn current_addr_writable(addr: usize) -> bool {
+    TASK_MANAGER.current_addr_writable(addr)
+}
+
+/// Map memory for current task (mmap)
+pub fn current_mmap(start: usize, len: usize, perm: MapPermission) -> bool {
+    TASK_MANAGER.current_mmap(start, len, perm)
+}
+
+/// Unmap memory for current task (munmap)
+pub fn current_munmap(start: usize, len: usize) -> bool {
+    TASK_MANAGER.current_munmap(start, len)
 }

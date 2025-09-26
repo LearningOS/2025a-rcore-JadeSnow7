@@ -96,6 +96,20 @@ impl TaskControlBlock {
             None
         }
     }
+    
+    /// Map virtual memory range (for mmap)
+    pub fn mmap(&mut self, start: usize, len: usize, perm: MapPermission) -> bool {
+        let start_va = VirtAddr(start);
+        let end_va = VirtAddr(start + len);
+        self.memory_set.mmap(start_va, end_va, perm)
+    }
+    
+    /// Unmap virtual memory range (for munmap) 
+    pub fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let start_va = VirtAddr(start);
+        let end_va = VirtAddr(start + len);
+        self.memory_set.munmap(start_va, end_va)
+    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
